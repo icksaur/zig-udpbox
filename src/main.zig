@@ -26,7 +26,7 @@ pub const UdpServer = struct {
         return UdpServer{ .sockfd = sockfd };
     }
 
-    pub fn recv(self: *UdpServer, buf: []u8, addr: *UdpAddr) !usize {
+    pub fn recv(self: *UdpServer, buf: []u8, addr: *UdpAddr) ![]u8 {
         var raw_addr: posix.sockaddr = undefined;
         var addrlen: posix.socklen_t = @sizeOf(posix.sockaddr);
         const n = try posix.recvfrom(self.sockfd, buf, 0, &raw_addr, &addrlen);
@@ -34,11 +34,12 @@ pub const UdpServer = struct {
             .addr = raw_addr,
             .addrlen = addrlen,
         };
-        return n;
+        return buf[0..@as(usize, n)];
     }
 
-    pub fn sendto(self: *UdpServer, data: []const u8, addr: UdpAddr) !usize {
-        return try posix.sendto(self.sockfd, data, 0, &addr.addr, addr.addrlen);
+    pub fn sendto(self: *UdpServer, data: []const u8, addr: UdpAddr) !void {
+        const sent = try posix.sendto(self.sockfd, data, 0, &addr.addr, addr.addrlen);
+        if (sent != data.len) return error.SendIncomplete;
     }
 
     pub fn deinit(self: *UdpServer) void {
@@ -48,31 +49,32 @@ pub const UdpServer = struct {
 
 pub const UdpClient = struct {
     sockfd: posix.fd_t,
-    server_addr: posix.sockaddr,
-    server_addrlen: posix.socklen_t,
+    server_ip: []const u8,
+    server_port: u16,
 
-    pub fn init(serverAddress: UdpAddr) !UdpClient {
+    pub fn init(server_ip: []const u8, server_port: u16) !UdpClient {
         const sockfd = try posix.socket(
             posix.AF.INET,
             posix.SOCK.DGRAM,
             0,
         );
         errdefer posix.close(sockfd);
-        // Do not bind; let the OS choose the port automatically
         return UdpClient{
             .sockfd = sockfd,
-            .server_addr = serverAddress.addr,
-            .server_addrlen = serverAddress.addrlen,
+            .server_ip = server_ip,
+            .server_port = server_port,
         };
     }
 
-    pub fn send(self: *UdpClient, data: []const u8) !usize {
-        return try posix.sendto(self.sockfd, data, 0, &self.server_addr, self.server_addrlen);
+    pub fn send(self: *UdpClient, data: []const u8) !void {
+        const addr = try net.Address.parseIp(self.server_ip, self.server_port);
+        const sent = try posix.sendto(self.sockfd, data, 0, &addr.any, @sizeOf(posix.sockaddr));
+        if (sent != data.len) return error.SendIncomplete;
     }
 
-    pub fn recv(self: *UdpClient, buf: []u8) !usize {
-        // Optionally, you can get the sender address, but here we ignore it
-        return try posix.recv(self.sockfd, buf, 0);
+    pub fn recv(self: *UdpClient, buf: []u8) ![]u8 {
+        const n = try posix.recv(self.sockfd, buf, 0);
+        return buf[0..@as(usize, n)];
     }
 
     pub fn deinit(self: *UdpClient) void {
@@ -81,33 +83,27 @@ pub const UdpClient = struct {
 };
 
 const defaultPort = 21612;
-fn serve() !void {
+fn serveEcho() !void {
     var server = try UdpServer.init(defaultPort);
     defer server.deinit();
     var buf: [2048]u8 = undefined;
     while (true) {
         var src_addr: UdpAddr = undefined;
-        const n = try server.recv(&buf, &src_addr);
-        std.debug.print("Echoing {d} bytes\n", .{n});
-        const msg = buf[0..@as(usize, n)];
-        _ = try server.sendto(msg, src_addr);
+        const msg = try server.recv(&buf, &src_addr);
+        std.debug.print("Echoing {d} bytes\n", .{msg.len});
+        try server.sendto(msg, src_addr);
     }
 }
-fn client() !void {
-    const addr = try net.Address.parseIp("127.0.0.1", defaultPort);
-    const server_addr = UdpAddr{
-        .addr = addr.any,
-        .addrlen = @sizeOf(posix.sockaddr),
-    };
-    var udp_client = try UdpClient.init(server_addr);
+fn clientSend() !void {
+    var udp_client = try UdpClient.init("127.0.0.1", defaultPort);
     defer udp_client.deinit();
 
     const msg = "udp test";
-    _ = try udp_client.send(msg);
+    try udp_client.send(msg);
 
     var buf: [2048]u8 = undefined;
-    const n = try udp_client.recv(&buf);
-    try std.io.getStdOut().writer().writeAll(buf[0..@as(usize, n)]);
+    const received = try udp_client.recv(&buf);
+    try std.io.getStdOut().writer().writeAll(received);
     try std.io.getStdOut().writer().writeAll("\n");
 }
 
@@ -119,9 +115,9 @@ pub fn main() !void {
         return;
     };
     if (std.mem.eql(u8, mode, "server")) {
-        try serve();
+        try serveEcho();
     } else if (std.mem.eql(u8, mode, "client")) {
-        try client();
+        try clientSend();
     } else {
         std.debug.print("Unknown mode: {s}\nUsage: zigudp <server|client>\n", .{mode});
     }
@@ -129,33 +125,21 @@ pub fn main() !void {
 
 test "UDP echo" {
     var buf: [2048]u8 = undefined;
-    // Start server: receive one message and echo it back
     var server = try UdpServer.init(defaultPort);
     defer server.deinit();
 
-    // Prepare client
-    const addr = try net.Address.parseIp("127.0.0.1", defaultPort);
-    const server_addr = UdpAddr{
-        .addr = addr.any,
-        .addrlen = @sizeOf(posix.sockaddr),
-    };
-    var udp_client = try UdpClient.init(server_addr);
-    defer udp_client.deinit();
+    var client = try UdpClient.init("127.0.0.1", defaultPort);
+    defer client.deinit();
 
-    // Client sends message
     const msg = "test udp";
-    _ = try udp_client.send(msg);
+    try client.send(msg);
 
-    // Server receives message
     var src_addr: UdpAddr = undefined;
-    const n = try server.recv(&buf, &src_addr);
-    try std.testing.expectEqualStrings(msg, buf[0..@as(usize, n)]);
+    const received = try server.recv(&buf, &src_addr);
+    try std.testing.expectEqualStrings(msg, received);
 
-    // Server echos back
-    const echo_msg = buf[0..@as(usize, n)];
-    _ = try server.sendto(echo_msg, src_addr);
+    try server.sendto(received, src_addr);
 
-    // Client receives echo
-    const m = try udp_client.recv(&buf);
-    try std.testing.expectEqualStrings(msg, buf[0..@as(usize, m)]);
+    const echoed = try client.recv(&buf);
+    try std.testing.expectEqualStrings(msg, echoed);
 }
