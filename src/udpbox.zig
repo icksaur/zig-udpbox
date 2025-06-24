@@ -4,6 +4,7 @@ const X25519 = crypto.dh.X25519;
 const Box = crypto.nacl.Box;
 const SecretBox = crypto.nacl.SecretBox;
 const AuthError = crypto.errors.AuthenticationError;
+const Allocator = std.mem.Allocator;
 const udp = @import("udp.zig");
 
 const generic_message: u8 = 0x00;
@@ -75,7 +76,7 @@ const UdpClient = struct {
         payload[payload.len - 1] = connect_bit;
         try self.client.send(payload);
     }
-    // Sends an encrypted message to the server using the shared secret established during the handshake
+    // Sends an encrypted message to the server.  Handshake must be sent first.
     pub fn send(self: *UdpClient, message: []const u8) !void {
         const payload = self.ciphertext_buffer[0 .. message.len + SecretBox.tag_length + self.nonce.len + 2];
         const ciphertext = payload[0 .. message.len + SecretBox.tag_length];
@@ -92,6 +93,7 @@ const UdpClient = struct {
         try self.client.send(self.ciphertext_buffer[0 .. ciphertext_size + self.nonce.len + 2]);
         incrementNonce(&self.nonce);
     }
+    // Receives an encrypted message from a client.  Hanshake must be sent first.
     pub fn recv(self: *UdpClient, buf: []u8) ![]u8 {
         const payload = try self.client.recv(buf);
         if (payload.len < SecretBox.tag_length + SecretBox.nonce_length) {
@@ -107,6 +109,7 @@ const UdpClient = struct {
 };
 
 const UdpServer = struct {
+    allocator: std.mem.Allocator, // Store the allocator in the struct
     server_keypair: X25519.KeyPair,
     server: udp.UdpServer,
     nonce: [Box.nonce_length]u8 = undefined,
@@ -115,23 +118,25 @@ const UdpServer = struct {
     client_addresses: std.AutoHashMap(u8, udp.UdpAddr),
     client_shared_secrets: std.AutoHashMap(u8, [X25519.shared_length]u8),
 
-    // todo: rationalize allocator
-    pub fn init(server_keypair: X25519.KeyPair, serverPort: u16) !UdpServer {
+    pub fn init(allocator: Allocator, server_keypair: X25519.KeyPair, serverPort: u16) !UdpServer {
         var server = UdpServer{
+            .allocator = allocator, // Initialize the allocator field
             .server_keypair = server_keypair,
             .server = try udp.UdpServer.init(serverPort),
-            .client_keys = std.AutoHashMap(u8, [X25519.public_length]u8).init(std.heap.page_allocator),
-            .client_addresses = std.AutoHashMap(u8, udp.UdpAddr).init(std.heap.page_allocator),
-            .client_shared_secrets = std.AutoHashMap(u8, [X25519.shared_length]u8).init(std.heap.page_allocator),
+            .client_keys = std.AutoHashMap(u8, [X25519.public_length]u8).init(allocator),
+            .client_addresses = std.AutoHashMap(u8, udp.UdpAddr).init(allocator),
+            .client_shared_secrets = std.AutoHashMap(u8, [X25519.shared_length]u8).init(allocator),
         };
         crypto.random.bytes(&server.nonce);
         return server;
     }
+
     pub fn deinit(self: *UdpServer) void {
         self.client_keys.deinit();
         self.client_shared_secrets.deinit();
         self.client_addresses.deinit();
         self.server.deinit();
+        // No need to deinitialize the allocator as it is managed externally
     }
     pub fn addClient(self: *UdpServer, client_public_key: [X25519.public_length]u8, client_id: u8) !void {
         if (self.client_keys.contains(client_id)) {
@@ -215,7 +220,10 @@ test "UDPBox client-server" {
     var alice_client = try UdpClient.init(alice, &bob.public_key, alice_id, "127.0.0.1", port);
     defer alice_client.deinit();
 
-    var bob_server = try UdpServer.init(bob, port);
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer if (gpa.deinit() == .leak) std.testing.expect(false) catch @panic("Memory leak detected");
+
+    var bob_server = try UdpServer.init(gpa.allocator(), bob, port);
     defer bob_server.deinit();
 
     try bob_server.addClient(alice.public_key, alice_id);
